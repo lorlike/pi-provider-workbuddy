@@ -1,7 +1,7 @@
 {
   "name": "pi-provider-workbuddy",
   "version": "0.2.0",
-  "description": "Pi extension for WorkBuddy (CodeBuddy) — dual-region providers (CN + Global) with OAuth login, dynamic model catalog with credit multipliers, DSML tool-call recovery, and read-only credit/status commands",
+  "description": "Pi extension for WorkBuddy (CodeBuddy) with desktop-client request identity, CN Claude Messages routing, dual-region OAuth, dynamic model catalog, credits, and daily check-in",
   "type": "module",
   "license": "MIT",
   "author": "lorlike",
@@ -35,8 +35,9 @@
   ],
   "scripts": {
     "build": "esbuild src/index.ts --bundle --platform=node --format=esm --outfile=dist/index.js --external:@earendil-works/pi-ai --external:@earendil-works/pi-coding-agent --external:@earendil-works/pi-ai/compat",
+    "test": "esbuild src/request-identity.test.ts --bundle --platform=node --format=esm --outfile=.test/request-identity.test.mjs --external:@earendil-works/pi-ai --external:@earendil-works/pi-ai/compat --external:@earendil-works/pi-coding-agent && node --test .test/request-identity.test.mjs",
     "typecheck": "tsc --noEmit",
-    "prepublishOnly": "npm run typecheck && npm run build"
+    "prepublishOnly": "npm run typecheck && npm test && npm run build"
   },
   "pi": {
     "extensions": [

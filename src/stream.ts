@@ -29,14 +29,20 @@ import {
   type SimpleStreamOptions,
   type TranscriptContext,
 } from '@earendil-works/pi-ai/compat'
+import { gzipSync } from 'node:zlib'
 
-import { WorkBuddyUpstreamClient, prepareChatBody, declaredTools, failureMessage, KIND_STATUS, classifyUpstreamError } from './client.ts'
+import {
+  WorkBuddyUpstreamClient,
+  prepareChatBody,
+  prepareMessagesBody,
+  failureMessage,
+  KIND_STATUS,
+} from './client.ts'
 import type { UpstreamErrorKind } from './client.ts'
 import { DsmlStreamBuffer, parseToolCalls, stripMarkup } from './dsml.ts'
 import type { RecoveredToolCall } from './dsml.ts'
 import type { WorkBuddyCredential } from './store.ts'
-
-const client = new WorkBuddyUpstreamClient()
+import type { WorkBuddyWireProtocol } from './wire-headers.ts'
 
 /**
  * A credential the stream can resolve per request. The store refreshes
@@ -77,6 +83,7 @@ function placeholderMessage(model: Model<Api>, errorMessage: string, aborted: bo
  */
 export function createWorkBuddyStream(
   resolveCredential: CredentialResolver,
+  protocol: WorkBuddyWireProtocol = 'chat',
 ): (model: Model<Api>, context: TranscriptContext, options?: SimpleStreamOptions) => AssistantMessageEventStream {
   return (model, context, options) => {
     const stream = createAssistantMessageEventStream()
@@ -89,9 +96,9 @@ export function createWorkBuddyStream(
         // from the transcript's system messages (the same source the inner
         // api reads; the request body itself is only fully known inside
         // onPayload, which is where prepareChatBody runs).
-        const declaredTools = getCurrentTools(context.messages)
+        const declaredTools = protocol === 'chat' ? getCurrentTools(context.messages) : []
         const gateNames = new Set(declaredTools.map(tool => tool.name))
-        const buffer = gateNames.size > 0
+        const buffer = protocol === 'chat' && gateNames.size > 0
           ? new DsmlStreamBuffer({
               declaredNames: gateNames,
               requiredParameters: new Map(declaredTools.map((tool) => {
@@ -105,8 +112,7 @@ export function createWorkBuddyStream(
             })
           : undefined
 
-        const { chatHeadersFor, upstreamBaseFor } = await import('./wire.ts')
-        const headers = chatHeadersFor(credential)
+        const { endpointFor, requestHeadersFor, upstreamBaseFor } = await import('./wire.ts')
         const base = upstreamBaseFor(credential)
         const upstream = new WorkBuddyUpstreamClient()
 
@@ -118,17 +124,50 @@ export function createWorkBuddyStream(
         const innerOptions: SimpleStreamOptions = {
           ...options,
           apiKey: 'workbuddy-managed',
-          headers,
+          headers: {
+            Authorization: `Bearer ${credential.accessToken}`,
+            ...(protocol === 'messages' ? { 'x-api-key': null } : {}),
+          },
+          maxRetries: 0,
+          timeoutMs: 1_200_000,
           onPayload: (payload: unknown) => {
             const params = payload as Record<string, unknown>
             params['stream'] = true
             return params
           },
           fetch: (async (_input: RequestInfo | URL, init?: RequestInit) => {
-            const bodyJson = typeof init?.body === 'string' ? init.body : ''
-            const prepared = prepareChatBody(bodyJson)
+            const bodyJson = await bodyText(init?.body)
+            const prepared = protocol === 'messages'
+              ? prepareMessagesBody(bodyJson)
+              : prepareChatBody(bodyJson)
             const signal = init?.signal ?? options?.signal
-            const result = await upstream.chatStream(credential, prepared, signal)
+            const headers = requestHeadersFor(
+              credential,
+              prepared,
+              options?.sessionId ?? '',
+              protocol,
+              init?.headers,
+            )
+            let requestBody: string | ArrayBuffer = prepared
+            if (protocol === 'chat') {
+              // The desktop CLI's GzipRequestProcessor compresses every model
+              // POST. This is material for long agent histories and also part
+              // of the request shape WorkBuddy measures.
+              const compressed = gzipSync(Buffer.from(prepared))
+              requestBody = compressed.buffer.slice(
+                compressed.byteOffset,
+                compressed.byteOffset + compressed.byteLength,
+              )
+              headers.set('Content-Encoding', 'gzip')
+            }
+            headers.delete('Content-Length')
+
+            const result = await upstream.modelStream(
+              endpointFor(credential, protocol),
+              requestBody,
+              headers,
+              signal,
+            )
             if (!result.ok) {
               const kind: UpstreamErrorKind = result.kind ?? 'server'
               const status = KIND_STATUS[kind]
@@ -152,8 +191,8 @@ export function createWorkBuddyStream(
           }) as typeof fetch,
         }
 
-        const { openAICompletionsApi } = await import('@earendil-works/pi-ai/compat')
-        const api = openAICompletionsApi()
+        const { anthropicMessagesApi, openAICompletionsApi } = await import('@earendil-works/pi-ai/compat')
+        const api = protocol === 'messages' ? anthropicMessagesApi() : openAICompletionsApi()
         const inner = api.streamSimple({ ...model, baseUrl: base }, context, innerOptions)
         for await (const event of inner) stream.push(event)
         stream.end()
@@ -169,6 +208,19 @@ export function createWorkBuddyStream(
 
     return stream
   }
+}
+
+/** Read a provider SDK's JSON body without assuming it is always a string. */
+async function bodyText(body: BodyInit | null | undefined): Promise<string> {
+  if (typeof body === 'string') return body
+  if (body === undefined || body === null) return ''
+  if (body instanceof ArrayBuffer) return new TextDecoder().decode(body)
+  if (ArrayBuffer.isView(body)) {
+    return new TextDecoder().decode(
+      new Uint8Array(body.buffer, body.byteOffset, body.byteLength),
+    )
+  }
+  return await new Response(body).text()
 }
 
 /**

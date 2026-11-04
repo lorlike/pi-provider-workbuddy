@@ -31,11 +31,12 @@ import type { Model, SimpleStreamOptions, TranscriptContext } from '@earendil-wo
 import { nativeImageInput, REFUSES_OFF_MODEL_IDS } from './catalog.ts'
 import { WorkBuddyCredentialStore } from './store.ts'
 import type { WorkBuddyUpstreamModel } from './store.ts'
-import { WorkBuddyUpstreamClient, prepareChatBody } from './client.ts'
+import { WorkBuddyUpstreamClient } from './client.ts'
 import { createWorkBuddyStream } from './stream.ts'
 import { oauthPoll, oauthStart, regionOfOAuthAccount } from './oauth.ts'
 import { CN_CHAT_BASE, GLOBAL_BASE, regionOf } from './upstream.ts'
 import type { WorkBuddyRegion } from './upstream.ts'
+import { CHAT_API, MESSAGES_API, apiForModel, usesMessagesApi } from './routing.ts'
 import {
   beijingDay,
   describeCheckinToday,
@@ -85,9 +86,15 @@ function workBuddyDisplayName(info: WorkBuddyUpstreamModel): string {
  * levels stay unavailable (`null`). `off` is offered exactly when the model
  * declares it AND is not on the measured refusal table.
  */
-function thinkingLevelMapFor(info: WorkBuddyUpstreamModel): Record<string, string | null> | undefined {
-  const supported = info.reasoning?.supportedEfforts?.filter(effort =>
+function thinkingLevelMapFor(
+  info: WorkBuddyUpstreamModel,
+  messages: boolean,
+): Record<string, string | null> | undefined {
+  const declared = info.reasoning?.supportedEfforts?.filter(effort =>
     ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'].includes(effort))
+  const supported = messages && declared !== undefined && !declared.includes('max')
+    ? [...declared, 'max']
+    : declared
   if (supported === undefined || supported.length === 0) return undefined
   const map: Record<string, string | null> = {}
   for (const level of ['minimal', 'low', 'medium', 'high', 'xhigh', 'max'] as const) {
@@ -105,24 +112,31 @@ function thinkingLevelMapFor(info: WorkBuddyUpstreamModel): Record<string, strin
 function toModelConfigs(region: WorkBuddyRegion, models: readonly WorkBuddyUpstreamModel[]): ProviderConfig['models'] {
   return models.map((info) => {
     const image = nativeImageInput(info.id)
-    const thinkingLevelMap = thinkingLevelMapFor(info)
+    const messages = usesMessagesApi(region, info.id)
+    const thinkingLevelMap = thinkingLevelMapFor(info, messages)
     return {
       id: info.id,
       name: workBuddyDisplayName(info),
+      api: apiForModel(region, info.id),
       reasoning: thinkingLevelMap !== undefined,
       ...(thinkingLevelMap === undefined ? {} : { thinkingLevelMap }),
       input: image === true ? ['text', 'image'] : ['text'],
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
       contextWindow: info.contextWindow,
       maxTokens: info.maxTokens,
-      compat: {
-        // The gateways reject the `developer` role (11128) and count
-        // `reasoning_effort` from the model's own ladder only.
-        supportsDeveloperRole: false,
-        supportsReasoningEffort: thinkingLevelMap !== undefined,
-        maxTokensField: 'max_tokens',
-        supportsStore: false,
-      },
+      compat: messages
+        // Messages carries effort as `output_config.effort`; the CN Claude
+        // models are adaptive-thinking models, so the route must use that
+        // field rather than chat's `reasoning_effort`.
+        ? { forceAdaptiveThinking: true, supportsTemperature: true }
+        : {
+            // The gateways reject the `developer` role (11128) and count
+            // `reasoning_effort` from the model's own ladder only.
+            supportsDeveloperRole: false,
+            supportsReasoningEffort: thinkingLevelMap !== undefined,
+            maxTokensField: 'max_tokens',
+            supportsStore: false,
+          },
     }
   })
 }
@@ -155,14 +169,16 @@ async function fetchCatalog(region: WorkBuddyRegion, force = false): Promise<rea
 }
 
 export default async function (pi: ExtensionAPI) {
-  const streamFor = (region: WorkBuddyRegion) =>
-    createWorkBuddyStream(async () => storeFor(region).resolve())
+  const streamFor = (
+    region: WorkBuddyRegion,
+    protocol: 'chat' | 'messages' = 'chat',
+  ) => createWorkBuddyStream(async () => storeFor(region).resolve(), protocol)
 
   const registerRegion = (region: WorkBuddyRegion, models: readonly WorkBuddyUpstreamModel[]) => {
     pi.registerProvider(PROVIDER_IDS[region], {
       name: PROVIDER_NAMES[region],
       baseUrl: region === 'cn' ? CN_CHAT_BASE : GLOBAL_BASE,
-      api: 'workbuddy-api',
+      api: CHAT_API,
       models: toModelConfigs(region, models),
       oauth: {
         name: PROVIDER_NAMES[region],
@@ -206,7 +222,7 @@ export default async function (pi: ExtensionAPI) {
             pi.registerProvider(PROVIDER_IDS[region2], {
               name: PROVIDER_NAMES[region2],
               baseUrl: region2 === 'cn' ? CN_CHAT_BASE : GLOBAL_BASE,
-              api: 'workbuddy-api',
+              api: CHAT_API,
               models: toModelConfigs(region2, models2),
             })
             return {
@@ -262,25 +278,40 @@ export default async function (pi: ExtensionAPI) {
     }
   }
 
-  // Register the custom API implementation that delegates to the built-in
-  // openai-completions with WorkBuddy wire rewrites.
+  // Register both wire implementations. Chat and Messages each delegate their
+  // parsing to Pi's built-in adapter; only headers, endpoint, body preparation
+  // and failure classification are WorkBuddy-specific.
   try {
     const compat = await import('@earendil-works/pi-ai/compat')
     const register = compat.registerApiProvider
     if (typeof register === 'function') {
       register(
         {
-          api: 'workbuddy-api',
+          api: CHAT_API,
           stream: (model, context, options) => {
             const region = providerRegionOf(model)
-            return streamFor(region)(model, context, options as SimpleStreamOptions | undefined)
+            return streamFor(region, 'chat')(model, context, options as SimpleStreamOptions | undefined)
           },
           streamSimple: (model, context, options) => {
             const region = providerRegionOf(model)
-            return streamFor(region)(model, context, options)
+            return streamFor(region, 'chat')(model, context, options)
           },
         },
-        'provider:workbuddy',
+        'provider:workbuddy-chat',
+      )
+      register(
+        {
+          api: MESSAGES_API,
+          stream: (model, context, options) => {
+            const region = providerRegionOf(model)
+            return streamFor(region, 'messages')(model, context, options as SimpleStreamOptions | undefined)
+          },
+          streamSimple: (model, context, options) => {
+            const region = providerRegionOf(model)
+            return streamFor(region, 'messages')(model, context, options)
+          },
+        },
+        'provider:workbuddy-messages',
       )
     }
   } catch (error) {

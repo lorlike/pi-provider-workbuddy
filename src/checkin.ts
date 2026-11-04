@@ -20,7 +20,7 @@ import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from '
 import { join } from 'node:path'
 import { pluginDataDir, workbuddyAccountId } from './auth.ts'
 import type { WorkBuddyCredential } from './auth.ts'
-import { CLIENT_UA, CN_BILLING_BASE, CHECKIN_STATUS_PATHS, DAILY_CHECKIN_PATH, JSON_TIMEOUT_MS } from './upstream.ts'
+import { APP_UA, CN_BILLING_BASE, CHECKIN_STATUS_PATHS, DAILY_CHECKIN_PATH, JSON_TIMEOUT_MS } from './upstream.ts'
 import type { WorkBuddyRegion } from './upstream.ts'
 
 /** The campaign as one account sees it. Absent fields stay undefined. */
@@ -88,7 +88,10 @@ function billingHeaders(credential: WorkBuddyCredential): Record<string, string>
     'Authorization': `Bearer ${credential.accessToken}`,
     'Accept': 'application/json',
     'Content-Type': 'application/json',
-    'User-Agent': CLIENT_UA,
+    'User-Agent': APP_UA,
+    'X-Product': 'SaaS',
+    'X-IDE-Type': 'WorkBuddy',
+    'X-IDE-Name': 'WorkBuddy',
     ...(credential.uid === '' ? {} : { 'X-User-Id': credential.uid }),
     ...(credential.enterpriseId === undefined || credential.enterpriseId === ''
       ? {}

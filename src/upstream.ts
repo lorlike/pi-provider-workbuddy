@@ -23,6 +23,8 @@
  *   global accounts read their own gateway.
  * - Chat is `/v2/chat/completions`, OpenAI-compatible, `stream: true` forced,
  *   `tool_choice` flattened to a string, `developer` rewritten to `system`.
+ * - The CN build serves Claude models on Anthropic's Messages route,
+ *   `/v1/messages`; the global build has no such route.
  * - Token refresh is `/v2/plugin/auth/token/refresh` with `X-Refresh-Token`
  *   (the ONLY place the refresh token travels).
  */
@@ -43,6 +45,9 @@ export const GLOBAL_CONFIG_PATH = '/v3/config'
 
 /** Chat endpoint (OpenAI-compatible, forced `stream: true`). */
 export const CHAT_PATH = '/v2/chat/completions'
+
+/** Anthropic Messages endpoint used by the CN build for Claude models. */
+export const MESSAGES_PATH = '/v1/messages'
 
 /** Token refresh; `X-Refresh-Token` appears here and nowhere else. */
 export const REFRESH_PATH = '/v2/plugin/auth/token/refresh'
@@ -65,20 +70,21 @@ export const CHECKIN_STATUS_PATHS: readonly string[] = [
 export const DAILY_CHECKIN_PATH = '/v2/billing/meter/daily-checkin'
 
 /**
- * The chat channel's user agent — the identity chat requests speak as.
- * The upstream bills and rate-limits chat as the CLI agent.
+ * WorkBuddy desktop identities measured from the current builds. The
+ * User-Agent is not merely decorative: WorkBuddy answers error 10085 when it
+ * does not start with WorkBuddy/<version>, and the channel selects different
+ * product-config documents.
  */
-export const CLIENT_UA = 'CLI/2.63.2 CodeBuddy/2.63.2'
+export const APP_VERSION = '5.9.3'
+export const CLI_VERSION = '2.165.0'
 
-/**
- * The product-config channel's UA: the app's own identity, byte-for-byte what
- * the app sends to `/v3/config`. Version suffixes are inert — what selects the
- * document is the CHANNEL the header claims, not the version in it.
- */
-export const PRODUCT_UA = 'WorkBuddy/5.8.3 WorkBuddy/5.8.3 CLI/2.161.0'
+export function clientUserAgent(region: WorkBuddyRegion): string {
+  const appName = region === 'global' ? 'workbuddy-ai' : 'WorkBuddy'
+  return `WorkBuddy/${APP_VERSION} ${appName}/${APP_VERSION} CLI/${CLI_VERSION}`
+}
 
-/** The app version inside PRODUCT_UA, for headers that need it alone. */
-export const APP_VERSION = PRODUCT_UA.match(/WorkBuddy\/([^\s]+)/u)?.[1] ?? '5.8.3'
+/** The desktop app's User-Agent for product and billing reads. */
+export const APP_UA = `WorkBuddy/${APP_VERSION}`
 
 /**
  * Region for a login domain; an empty domain means CN (matching upstream
@@ -124,10 +130,6 @@ export function chatBase(credential: { domain: string }): string {
 }
 
 export function billingBase(credential: { domain: string }): string {
-  return regionOf(credential.domain) === 'global' ? globalBase(credential.domain) : CN_BILLING_BASE
-}
-
-export function originReferer(credential: { domain: string }): string {
   return regionOf(credential.domain) === 'global' ? globalBase(credential.domain) : CN_BILLING_BASE
 }
 
