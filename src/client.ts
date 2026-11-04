@@ -4,27 +4,26 @@
  *
  * Wire behaviour follows the measured protocol in dingminhua/dsh-connect-workbuddy
  * (MIT), which credits corrinehu/dsh-workbuddy-connect and Sliverkiss/workbuddy2api.
- * Security red lines carried over: chat requests never carry the refresh token;
- * every conversation identity value is generated fresh per request.
+ * Security red lines carried over: model requests never carry the refresh
+ * token. Conversation and turn ids are stable for their scope; only the
+ * per-message/per-request id is fresh for each HTTP request.
  */
 
-import { randomBytes, randomUUID } from 'node:crypto'
+import { randomBytes } from 'node:crypto'
 import {
-  CHAT_PATH,
   chatBase,
-  CLIENT_UA,
+  APP_UA,
   ERROR_BODY_LIMIT,
   GLOBAL_CONFIG_PATH,
   JSON_TIMEOUT_MS,
   MODELS_CATALOG_PATH,
-  originReferer,
-  PRODUCT_UA,
   regionOf,
   globalBase,
 } from './upstream.ts'
 import type { WorkBuddyCredential } from './store.ts'
 import { selectCliModels } from './store.ts'
 import type { WorkBuddyUpstreamModel } from './store.ts'
+import { workBuddyProductHeaders } from './wire-headers.ts'
 
 /**
  * Upstream failure classes the client maps onto distinct HTTP answers.
@@ -368,6 +367,53 @@ export function prepareChatBody(source: string): string {
   return JSON.stringify(obj)
 }
 
+/**
+ * Anthropic Messages bodies go to WorkBuddy essentially as the agent sent
+ * them. The one measured exception is unsigned thinking: a history moved from
+ * the chat route can contain unsigned blocks, and their presence beside a
+ * signed block is refused with 11159 as belonging to another conversation.
+ * Unsigned thinking cannot be verified by the model anyway, so it is dropped.
+ */
+function removeUnsignedThinking(obj: Record<string, unknown>): boolean {
+  const messages = obj['messages']
+  if (!Array.isArray(messages)) return false
+  let changed = false
+  for (const value of messages) {
+    if (typeof value !== 'object' || value === null || Array.isArray(value)) continue
+    const message = value as Record<string, unknown>
+    if (message['role'] !== 'assistant' || !Array.isArray(message['content'])) continue
+    const kept = message['content'].filter((part) => {
+      if (typeof part !== 'object' || part === null || Array.isArray(part)) return true
+      const block = part as Record<string, unknown>
+      return block['type'] !== 'thinking'
+        || (typeof block['signature'] === 'string' && block['signature'] !== '')
+    })
+    if (kept.length === message['content'].length) continue
+    changed = true
+    message['content'] = kept.length > 0 ? kept : [{ type: 'text', text: '' }]
+  }
+  return changed
+}
+
+/**
+ * Prepare an Anthropic Messages body for the CN WorkBuddy route. It is not a
+ * chat conversion: system blocks, tools, developers and token fields stay as
+ * the agent wrote them.
+ */
+export function prepareMessagesBody(source: string): string {
+  let body: unknown
+  try {
+    body = JSON.parse(source)
+  } catch {
+    return source
+  }
+  if (typeof body !== 'object' || body === null || Array.isArray(body)) return source
+  const obj = body as Record<string, unknown>
+  obj['stream'] = true
+  removeUnsignedThinking(obj)
+  return JSON.stringify(obj)
+}
+
 /** Tool names this request offered, for DSML recovery's gate 2. */
 export interface DeclaredTools {
   names: ReadonlySet<string>
@@ -412,52 +458,6 @@ export function declaredTools(bodyJson: string): DeclaredTools | undefined {
   return { names, requiredParameters, acceptedParameters }
 }
 
-// ---------------------------------------------------------------------------
-// Headers
-// ---------------------------------------------------------------------------
-
-/** Headers every upstream request shares. */
-function commonHeaders(credential: WorkBuddyCredential): Record<string, string> {
-  return {
-    'Accept': 'application/json, text/plain, */*',
-    'X-Requested-With': 'XMLHttpRequest',
-    'Origin': originReferer(credential),
-    'Referer': `${originReferer(credential)}/`,
-    'User-Agent': CLIENT_UA,
-  }
-}
-
-/**
- * The conversation-identity triple the chat endpoint now requires. Any
- * well-formed UUID passes; values are freshly generated per request, as the
- * official client does. Applied to both regions on purpose — a header that is
- * only ever sent on one side is exactly how a gate becomes invisible.
- */
-function conversationHeaders(): Record<string, string> {
-  return {
-    'X-Conversation-ID': randomUUID(),
-    'X-Conversation-Request-ID': randomUUID(),
-    'X-Conversation-Message-ID': randomUUID(),
-  }
-}
-
-/** Chat request headers, including the X-No-* conventions the official CLI uses. */
-function chatHeaders(credential: WorkBuddyCredential): Record<string, string> {
-  return {
-    ...commonHeaders(credential),
-    'Content-Type': 'application/json',
-    // 安全红线：chat 请求绝不携带 refresh token。
-    'Authorization': `Bearer ${credential.accessToken}`,
-    ...(credential.uid === '' ? { 'X-No-User-Id': '1' } : { 'X-User-Id': credential.uid }),
-    ...(credential.enterpriseId === undefined || credential.enterpriseId === ''
-      ? { 'X-No-Enterprise-Id': '1' }
-      : { 'X-Enterprise-Id': credential.enterpriseId }),
-    ...(credential.domain === '' ? { 'X-No-Department-Info': '1' } : { 'X-Domain': credential.domain }),
-    'X-Product': 'SaaS',
-    ...conversationHeaders(),
-  }
-}
-
 /** Read a JSON envelope; throws with the classified error on failure. */
 async function readEnvelope(response: Response): Promise<Record<string, unknown>> {
   const text = await response.text()
@@ -492,18 +492,23 @@ function envelopeData(document: Record<string, unknown>): Record<string, unknown
  * refreshes apply on the next call.
  */
 export class WorkBuddyUpstreamClient {
-  /** POST the chat endpoint; a successful answer is the raw SSE response. */
-  async chatStream(
-    credential: WorkBuddyCredential,
-    bodyJson: string,
+  /**
+   * POST a model endpoint. Headers are assembled by the wire layer because
+   * they carry per-request conversation identity; a successful answer is the
+   * raw SSE response.
+   */
+  async modelStream(
+    endpoint: string,
+    body: string | ArrayBuffer,
+    headers: Headers,
     signal?: AbortSignal,
   ): Promise<WorkBuddyChatResult> {
     let response: Response
     try {
-      response = await fetch(`${chatBase(credential)}${CHAT_PATH}`, {
+      response = await fetch(endpoint, {
         method: 'POST',
-        headers: chatHeaders(credential),
-        body: bodyJson,
+        headers,
+        body,
         ...(signal === undefined ? {} : { signal }),
       })
     } catch (error) {
@@ -534,13 +539,7 @@ export class WorkBuddyUpstreamClient {
     const timeout = signal ?? AbortSignal.timeout(JSON_TIMEOUT_MS)
     const readCatalog = async (path: string): Promise<readonly WorkBuddyUpstreamModel[]> => {
       const response = await fetch(`${chatBase(credential)}${path}`, {
-        headers: {
-          'Authorization': `Bearer ${credential.accessToken}`,
-          'Accept': 'application/json',
-          'Origin': originReferer(credential),
-          'Referer': `${originReferer(credential)}/`,
-          'User-Agent': PRODUCT_UA,
-        },
+        headers: workBuddyProductHeaders(credential),
         signal: timeout,
       })
       const envelope = await readEnvelope(response)
@@ -569,6 +568,10 @@ export class WorkBuddyUpstreamClient {
       'Authorization': `Bearer ${credential.accessToken}`,
       'Accept': 'application/json',
       'Content-Type': 'application/json',
+      'User-Agent': APP_UA,
+      'X-Product': 'SaaS',
+      'X-IDE-Type': 'WorkBuddy',
+      'X-IDE-Name': 'WorkBuddy',
       ...(credential.uid !== '' ? { 'X-User-Id': credential.uid } : {}),
       ...(credential.enterpriseId !== undefined && credential.enterpriseId !== ''
         ? { 'X-Enterprise-Id': credential.enterpriseId, 'X-Tenant-Id': credential.enterpriseId }

@@ -11,6 +11,8 @@
 - **双区域并行接入**：`workbuddy`（国内版，`copilot.tencent.com`）与 `workbuddy-global`（国际版，`workbuddy.ai`）同时注册，各自持有凭据、目录与模型，互不干扰。哪个区域有账号，哪个区域的模型就出现在 pi 的模型选择器里。
 - **登录即用**：`/login` 一条命令完成扫码（国内版）或网页登录（国际版），无需手动配置 API key。
 - **自动发现桌面端登录**：已安装 WorkBuddy 桌面 App 的机器上，插件自动读取它的登录状态（**始终只读**，永远不会改动桌面端的凭据）。Windows 新版桌面端加密的凭据字段，通过调用已安装 App 自身的解密能力读取；App 未安装时如实报告，不会谎报「未登录」。
+- **按桌面客户端重做请求层**：使用 WorkBuddy 桌面 CLI 的客户端归属头、User-Agent、OpenAI SDK 指纹，以及稳定的会话 ID / 用户发送 ID / 每请求消息 ID；一次工具循环仍只算一次用户发送。
+- **按模型选择协议**：国内版 Claude 走 Anthropic Messages（`/v1/messages`），其余模型与国际版全部走 Chat Completions（`/v2/chat/completions`）。
 - **模型名内嵌积分倍率**：模型显示为 `GLM-5.3 · x0.79` 这样的形式，倍率完全来自上游目录，插件不写死也不猜。
 - **只读积分查询**：`/workbuddy.status` 查看两个区域的登录状态、token 有效期、积分余额，以及国内版**今天有没有签到**，不花积分。
 - **每日签到**：`/workbuddy.sign` 领取国内版（WorkBuddy CN）的每日签到积分。先查活动状态，活动进行中且今天未领才领取——重复执行不会重复领，也不会把「今天已签」报成失败。
@@ -65,6 +67,52 @@ pi install git:github.com/lorlike/pi-provider-workbuddy
 | `/workbuddy.refresh` | 从上游刷新模型目录并重载 |
 | `/workbuddy.logout [cn\|global]` | 清除插件自己存的凭据（不影响桌面端登录）；不带参数默认清两个区域 |
 
+## 请求身份与模型路由
+
+请求头不是只为了“能返回 200”。WorkBuddy 的用量后台依靠这些值识别使用端、会话和一次用户发送；缺字段时会归到空客户端，ID 不稳定时则会把同一次工具循环拆成多次请求。
+
+### 使用端与客户端身份
+
+| 请求头 | 值 | 作用 |
+| --- | --- | --- |
+| `User-Agent` | 国内版 `WorkBuddy/5.9.3 WorkBuddy/5.9.3 CLI/2.165.0`；国际版 `WorkBuddy/5.9.3 workbuddy-ai/5.9.3 CLI/2.165.0` | 声明桌面 CLI 客户端 |
+| `X-IDE-Name` / `X-IDE-Type` | `WorkBuddy` | 使用端显示为 WorkBuddy |
+| `X-IDE-Version` | `5.9.3` | 客户端版本 |
+| `X-Agent-Purpose` | `conversation` | 请求属于对话 |
+| `X-Agent-Intent` | `craft` | 桌面客户端的 agent 意图 |
+| `X-Agent-Type` | `main` | 主对话 agent |
+| `X-Agent-Runtime` | `local-agent` | 本地 agent 运行时 |
+| `X-Product` | `SaaS` | 产品通道 |
+| `X-User-Id` / `X-Domain` | 当前账号 | 账号与登录域 |
+| `X-Enterprise-Id` / `X-Tenant-Id` | 当前企业 | 仅在当前账号有企业 ID 时发送 |
+| `X-Stainless-*` | OpenAI `6.25.0` / Electron Node `v22.21.1` | 声明桌面客户端内置 SDK 指纹 |
+
+宿主 SDK 自带的 `Authorization`、`x-api-key`、User-Agent、浏览器标记和 `X-Stainless-*` 会在最终发请求前被清除；真实的 `Authorization` 与 WorkBuddy 桌面身份头再统一写入。Messages 路由的 `anthropic-beta` 等协议头会保留。
+
+### 三个 ID 与计费计数
+
+| 请求头 | 生命周期 | 规则 |
+| --- | --- | --- |
+| `X-Conversation-ID` | 整个对话 | Pi 有 `sessionId` 时由它稳定派生；否则由第一条真实用户消息派生。两者都没有时不发送，绝不临时编造 |
+| `X-Conversation-Request-ID` | 一次用户发送 | 用户发出这条消息后，所有工具调用回传、工具结果图片、重试都复用同一个值；用户发下一条消息时生成新值 |
+| `X-Conversation-Message-ID` / `X-Request-ID` | 一次 HTTP 请求 | 每次 HTTP 请求都新生成，两个头始终相同 |
+
+因此，**一次工具循环不是多次用户发送**。WorkBuddy 后台按 `X-Conversation-Request-ID` 把整段循环计为一次请求；只有用户真正发送下一条消息，或发出无法归属到具体用户消息的请求时，才会出现新的计数。
+
+ID 由进程内随机盐、账号作用域、会话标识和用户消息签名派生：相同消息在不同账号下不会复用同一 ID，消息原文也不会以明文出现在 ID 中。
+
+### 协议路由矩阵
+
+| 区域 | 模型 | 协议 | 终结点 | 请求体 |
+| --- | --- | --- | --- | --- |
+| 国内版 | 模型 ID 以 `claude-` 开头 | Anthropic Messages | `/v1/messages` | 保持 agent 的 Messages 结构；不 gzip；只删除无签名 thinking |
+| 国内版 | 其他模型 | Chat Completions | `/v2/chat/completions` | 强制 `stream: true`；按桌面客户端行为 gzip |
+| 国际版 | 所有模型，包括 Claude | Chat Completions | `/v2/chat/completions` | 强制 `stream: true`；按桌面客户端行为 gzip |
+
+只有国内版提供 `/v1/messages`；把国际版 Claude 发到 Messages 只会得到 404。国内版 Claude 在 Messages 上额外开放 `max` thinking 档，并映射为 Anthropic 的 `output_config.effort`。
+
+客户端版本目前按已测得的桌面端固定为 WorkBuddy `5.9.3` / CLI `2.165.0`。上游升级后应同步更新 `src/upstream.ts` 与 `src/wire-headers.ts` 中的版本常量。
+
 ### 签到（目前只有国内版）
 
 ```text
@@ -112,8 +160,10 @@ pi（openai-completions 内建实现）
   → 自定义 fetch 覆盖层：
       · prepareChatBody：强制 stream:true、tool_choice 压平、
         developer→system、保证 system 头、已测得的渠道指纹前置中性头
-      · WorkBuddy 头：Bearer token、会话身份三件套（每请求现生成）、
-        CLI UA、X-User-Id / X-Enterprise-Id / X-Domain
+      · WorkBuddy 头：Bearer token、桌面客户端归属、CLI UA、
+        X-User-Id / X-Enterprise-Id / X-Domain
+      · 会话 ID、用户发送 ID、每请求消息 ID 分层生成
+      · Chat 请求 gzip；CN Claude 改走 Anthropic Messages 且不 gzip
   → 国内版 https://copilot.tencent.com/v2/chat/completions
     国际版 https://www.workbuddy.ai（或 codebuddy.ai，按凭据域路由）
   → SSE 流过 DSML 恢复缓冲（见「功能」第 6 条）
@@ -139,6 +189,7 @@ git clone https://github.com/lorlike/pi-provider-workbuddy.git
 cd pi-provider-workbuddy
 npm install
 npm run typecheck   # 类型检查
+npm test            # 11 个单元/最终请求集成测试
 npm run build       # 构建到 dist/
 ```
 
